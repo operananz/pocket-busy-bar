@@ -228,6 +228,29 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:20px;heigh
       <input type="range" id="sBright" min="10" max="100" value="85" aria-label="Brightness">
     </div>
     <div class="setrow">
+      <div class="txt"><b>Text size</b><span>Large fills the full bar height</span></div>
+      <div class="seg" id="sFont">
+        <button data-scale="1">Normal</button>
+        <button data-scale="2">Large</button>
+      </div>
+    </div>
+    <div class="setrow">
+      <div class="txt"><b>Bold text</b><span>Thicker, heavier letters</span></div>
+      <label class="switch"><input type="checkbox" id="sBold"><span class="track"></span><span class="knob"></span></label>
+    </div>
+    <div class="setrow">
+      <div class="txt"><b>Fill background</b><span>Solid colour panel with punched-out letters, like the real BUSY Bar</span></div>
+      <label class="switch"><input type="checkbox" id="sFill"><span class="track"></span><span class="knob"></span></label>
+    </div>
+    <div class="setrow">
+      <div class="txt"><b>Invert colours</b><span>Swap panel &amp; letters (e.g. red-on-white)</span></div>
+      <label class="switch"><input type="checkbox" id="sInvert"><span class="track"></span><span class="knob"></span></label>
+    </div>
+    <div class="field" style="padding:8px 0 2px">
+      <label class="cap">Letter colour <span style="text-transform:none;letter-spacing:0;color:var(--faint);font-family:var(--sans)">(fill mode)</span></label>
+      <div class="swatches" id="sLetter"></div>
+    </div>
+    <div class="setrow">
       <div class="txt"><b>Sound</b><span>Chime on focus / break switches</span></div>
       <label class="switch"><input type="checkbox" id="sSound" checked><span class="track"></span><span class="knob"></span></label>
     </div>
@@ -327,23 +350,45 @@ const ICONS = {
   phone:["0000110","0001100","0001000","0010000","0110000","1100100","1111000"]
 };
 
-/* build a boolean matrix [7][W] from a string (+ optional leading icon) */
-function textMatrix(str, iconKey){
+/* thicken a glyph horizontally by 1 column (fake-bold for bitmap fonts) */
+function embolden(g){
+  return g.map(line=>{
+    const w = line.length; let out="";
+    for(let c=0;c<=w;c++){
+      const a = c<w && line[c]==="1";
+      const b = c>0 && line[c-1]==="1";
+      out += (a||b) ? "1" : "0";
+    }
+    return out;
+  });
+}
+
+/* build a boolean matrix [7*scale][W] from a string (+ optional leading icon).
+   scale is an integer (1 or 2) so pixels stay crisp on the LED grid; bold thickens strokes. */
+function textMatrix(str, iconKey, scale, bold){
+  scale = Math.max(1, Math.round(scale||1));
   str = (str||"").toUpperCase();
-  const glyphs = [];
+  let glyphs = [];
   if(iconKey && ICONS[iconKey]) glyphs.push(ICONS[iconKey]);
   for(const ch of str){ glyphs.push(F[ch] || F["?"]); }
-  // assemble with 1-col gaps
-  const rows = [[],[],[],[],[],[],[]];
+  if(bold) glyphs = glyphs.map(embolden);
+  const H = 7*scale;
+  const rows = Array.from({length:H}, ()=>[]);
   glyphs.forEach((g,gi)=>{
-    if(gi>0){ for(let r=0;r<7;r++) rows[r].push(0); } // gap
+    if(gi>0){ for(let r=0;r<H;r++) for(let k=0;k<scale;k++) rows[r].push(0); } // gap = scale cols
     const w = g[0].length;
     for(let r=0;r<7;r++){
       const line = g[r] || "0".repeat(w);
-      for(let c=0;c<w;c++) rows[r].push(line[c]==="1"?1:0);
+      for(let sy=0;sy<scale;sy++){
+        const rr = r*scale+sy;
+        for(let c=0;c<w;c++){
+          const bit = line[c]==="1"?1:0;
+          for(let sx=0;sx<scale;sx++) rows[rr].push(bit);
+        }
+      }
     }
   });
-  return { rows, width: rows[0].length };
+  return { rows, width: rows[0].length, height: H };
 }
 
 /* ============================ state ============================ */
@@ -371,7 +416,7 @@ const defaults = {
   status:{text:"BUSY",color:COLORS.busy,anim:"static",icon:"none",presetIdx:0},
   custom:{text:"HELLO",color:COLORS.avail,anim:"scroll",icon:"none",hue:140},
   focus:{focusMin:25,breakMin:5,rounds:4},
-  settings:{brightness:85,sound:true,wake:false}
+  settings:{brightness:85,sound:true,wake:false,fontScale:2,bold:true,fill:true,invert:false,letterColor:"#ffffff"}
 };
 let state = load();
 function load(){
@@ -389,7 +434,7 @@ function save(){ try{ localStorage.setItem(LS_KEY, JSON.stringify(state)); }catc
 const timer = { phase:"idle", round:1, running:false, endTs:0, remainingMs:0, totalMs:0 };
 
 /* ============================ LED rendering ============================ */
-const COLS=72, ROWS=16, YBASE=4; // 7-tall text vertically centred
+const COLS=72, ROWS=16; // logical LED grid; text is vertically centred per size
 const canvas = document.getElementById("bar");
 const ctx = canvas.getContext("2d");
 const pcanvas = document.getElementById("presentCanvas");
@@ -430,10 +475,17 @@ function drawGrid(g, c, W, H, now){
   const content = currentContent();
   const bright = state.settings.brightness/100;
 
-  // build matrix (cache by text+icon)
-  const key = content.text+"|"+content.icon;
-  if(matrixCache.key!==key){ matrixCache = {key, m:textMatrix(content.text, content.icon)}; }
+  // build matrix (cache by text+icon+scale+bold)
+  const scale = state.settings.fontScale||1;
+  const bold = !!state.settings.bold;
+  const fill = !!state.settings.fill;
+  const invert = !!state.settings.invert;
+  const letterColor = state.settings.letterColor || "#ffffff";
+  const key = content.text+"|"+content.icon+"|"+scale+"|"+bold;
+  if(matrixCache.key!==key){ matrixCache = {key, m:textMatrix(content.text, content.icon, scale, bold)}; }
   const M = matrixCache.m;
+  const gh = M.height;                          // glyph block height (7 or 14)
+  const yBase = Math.floor((ROWS - gh)/2);      // vertical centring
 
   let anim = content.anim;
   if(reduceMotion && (anim==="blink"||anim==="pulse"||anim==="rainbow")) anim="static";
@@ -460,39 +512,49 @@ function drawGrid(g, c, W, H, now){
     for(let col=0; col<COLS; col++){
       const cx = col*pitch + pitch/2;
       const cy = row*pitch + pitch/2;
-      let on=false, colHex=content.color, mul=globalMul;
 
-      // text pixels
-      const tr = row - YBASE;
-      if(tr>=0 && tr<7){
-        // map screen col to matrix col (handle scroll wrap)
+      // is this a lit text pixel?
+      let textOn=false;
+      const tr = row - yBase;
+      if(tr>=0 && tr<gh){
         let mc;
         if(anim==="scroll" || overflow){
           const span = M.width + COLS;
           mc = Math.floor(col - baseX);
           mc = ((mc % span)+span)%span;
-          if(mc < M.width && M.rows[tr][mc]) on=true;
+          if(mc < M.width && M.rows[tr][mc]) textOn=true;
         } else {
           mc = col - baseX;
-          if(mc>=0 && mc<M.width && M.rows[tr][mc]) on=true;
+          if(mc>=0 && mc<M.width && M.rows[tr][mc]) textOn=true;
         }
       }
-      if(on && anim==="rainbow"){ colHex = hslToHex((col*7 + now/16)%360, 90, 58); }
-
       // focus progress bar on bottom row
-      if(content.progress!=null && row===ROWS-1){
-        const lit = col < Math.round(content.progress*COLS);
-        if(lit){ on=true; colHex=content.progressColor; mul=1; }
+      let progOn=false;
+      if(content.progress!=null && row===ROWS-1){ progOn = col < Math.round(content.progress*COLS); }
+
+      let on=false, colHex=content.color, mul=globalMul, bloom=true;
+      if(fill){
+        // solid colour field with letters/progress punched out (like the real BUSY Bar)
+        const fieldColor = invert ? letterColor : content.color;
+        const inkColor   = invert ? content.color : letterColor;
+        on=true;
+        if(textOn || progOn){ colHex=inkColor; }
+        else { colHex=fieldColor; bloom=false; mul=globalMul*0.55; }
+      } else {
+        if(textOn){ on=true; colHex = anim==="rainbow" ? hslToHex((col*7 + now/16)%360, 90, 58) : content.color; }
+        else if(progOn){ on=true; colHex=content.progressColor; mul=1; }
       }
 
       if(on){
         const [r,gc,b] = hexToRgb(colHex);
         const a = Math.max(0, Math.min(1, mul*bright));
         // soft bloom (cheap: a larger low-alpha disc instead of shadowBlur)
-        c.beginPath();
-        c.fillStyle = `rgba(${r},${gc},${b},${0.15*a})`;
-        c.arc(cx,cy,rDot*1.75,0,7);
-        c.fill();
+        if(bloom){
+          c.beginPath();
+          c.fillStyle = `rgba(${r},${gc},${b},${0.15*a})`;
+          c.arc(cx,cy,rDot*1.75,0,7);
+          c.fill();
+        }
         // bright core
         c.beginPath();
         c.fillStyle = `rgba(${r},${gc},${b},${a})`;
@@ -512,7 +574,7 @@ function isAnimating(){
   const content = currentContent();
   let anim = content.anim;
   if(reduceMotion && (anim==="blink"||anim==="pulse"||anim==="rainbow")) anim="static";
-  const M = matrixCache.m || textMatrix(content.text, content.icon);
+  const M = matrixCache.m || textMatrix(content.text, content.icon, state.settings.fontScale||1, state.settings.bold);
   const overflow = M.width>COLS;
   return timer.running ||
          anim==="scroll" || anim==="blink" || anim==="pulse" || anim==="rainbow" || overflow;
@@ -526,7 +588,7 @@ function loop(now){
     if(needsRedraw || now-lastDraw >= 33){   // cap ~30fps
       const dt = Math.min(64, now-lastT); lastT = now;
       const content = currentContent();
-      const M = matrixCache.m || textMatrix(content.text, content.icon);
+      const M = matrixCache.m || textMatrix(content.text, content.icon, state.settings.fontScale||1, state.settings.bold);
       if((content.anim==="scroll" || M.width>COLS) && content.progress==null){
         scrollX += dt*0.030*(reduceMotion?0.7:1);
       } else if(content.progress==null){ scrollX = 0; }
@@ -754,6 +816,24 @@ const sBright=document.getElementById("sBright"), sSound=document.getElementById
 sBright.value=state.settings.brightness;
 sSound.checked=state.settings.sound; sWake.checked=state.settings.wake;
 sBright.addEventListener("input",()=>{ state.settings.brightness=+sBright.value; save(); kick(); });
+const sFont=document.getElementById("sFont");
+function syncFontUI(){ sFont.querySelectorAll("button").forEach(b=>b.setAttribute("aria-pressed",(+b.dataset.scale)===(state.settings.fontScale||1)?"true":"false")); }
+sFont.querySelectorAll("button").forEach(b=>b.addEventListener("click",()=>{ state.settings.fontScale=+b.dataset.scale; matrixCache.key=""; save(); syncFontUI(); kick(); }));
+const sBold=document.getElementById("sBold"), sFill=document.getElementById("sFill"), sInvert=document.getElementById("sInvert");
+sBold.checked=!!state.settings.bold; sFill.checked=!!state.settings.fill; sInvert.checked=!!state.settings.invert;
+sBold.addEventListener("change",()=>{ state.settings.bold=sBold.checked; matrixCache.key=""; save(); kick(); });
+sFill.addEventListener("change",()=>{ state.settings.fill=sFill.checked; save(); kick(); });
+sInvert.addEventListener("change",()=>{ state.settings.invert=sInvert.checked; save(); kick(); });
+// letter colour swatches
+const LETTER_COLORS={White:"#ffffff",Black:"#000000",Red:COLORS.busy,Amber:COLORS.focus,Green:COLORS.avail,Blue:COLORS.break,Pink:COLORS.meet,Violet:COLORS.deep};
+const sLetter=document.getElementById("sLetter");
+Object.values(LETTER_COLORS).forEach(col=>{
+  const s=document.createElement("button"); s.className="chip"; s.style.setProperty("--c",col);
+  if(col==="#000000") s.style.boxShadow="0 0 0 1px var(--line) inset";
+  s.addEventListener("click",()=>{ state.settings.letterColor=col; save(); syncLetterUI(); kick(); });
+  sLetter.appendChild(s);
+});
+function syncLetterUI(){ sLetter.querySelectorAll(".chip").forEach(c=>c.setAttribute("aria-pressed", c.style.getPropertyValue("--c").trim()===(state.settings.letterColor||"#ffffff")?"true":"false")); }
 sSound.addEventListener("change",()=>{ state.settings.sound=sSound.checked; ensureAudio(); save(); });
 sWake.addEventListener("change",()=>{ state.settings.wake=sWake.checked; save(); if(sWake.checked) requestWakeIfNeeded(); else releaseWake(); });
 
@@ -772,7 +852,7 @@ function tickClock(){
 setInterval(tickClock,10000); tickClock();
 
 // init
-syncFocusUI(); syncCustomUI(); updateClockUI(); refreshPresets();
+syncFocusUI(); syncCustomUI(); syncFontUI(); syncLetterUI(); updateClockUI(); refreshPresets();
 if(state.settings.wake) requestWakeIfNeeded();
 kick();
 </script>
