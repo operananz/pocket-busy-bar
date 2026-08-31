@@ -595,7 +595,7 @@ function loop(now){
 
       sizeCanvas(canvas, ctx);
       drawGrid(document, ctx, canvas._cssW, canvas._cssH, now);
-      if(presentOn){ sizePresent(); drawGrid(document, pctx, pcanvas._cssW, pcanvas._cssH, now); }
+      if(presentOn){ drawPresent(now); }
 
       if(timer.running){
         timer.remainingMs = timer.endTs - Date.now();
@@ -621,26 +621,94 @@ function sizeCanvas(cv, cx){
 }
 
 /* ============================ present mode ============================ */
-let presentOn=false, presentRot=false;
+let presentOn=false;
 const present = document.getElementById("present");
-function openPresent(){ presentOn=true; present.classList.add("on"); present.setAttribute("aria-hidden","false"); sizePresent(true); requestWakeIfNeeded(true); kick(); }
+function openPresent(){ presentOn=true; present.classList.add("on"); present.setAttribute("aria-hidden","false"); requestWakeIfNeeded(true); kick(); }
 function closePresent(){ presentOn=false; present.classList.remove("on"); present.setAttribute("aria-hidden","true"); if(!state.settings.wake) releaseWake(); }
-function sizePresent(force){
+
+/* full-screen LED field: the whole phone becomes the panel, letters centred.
+   Portrait renders the bar rotated (running down the long axis); landscape is natural. */
+function drawPresent(now){
   const W=window.innerWidth, H=window.innerHeight;
-  presentRot = H>W; // portrait → rotate the bar to run along the long axis
-  const availLong = presentRot?H:W, availShort = presentRot?W:H;
-  let barW = availLong*0.94;
-  let barH = barW*(ROWS/COLS);
-  if(barH>availShort*0.9){ barH=availShort*0.9; barW=barH*(COLS/ROWS); }
-  const dpr = Math.min(window.devicePixelRatio||1,3);
-  const needW=Math.round(barW), needH=Math.round(barH);
-  if(!force && pcanvas._cssW===needW && pcanvas._cssH===needH && pcanvas._rot===presentRot) return;
-  pcanvas.style.width=needW+"px"; pcanvas.style.height=needH+"px";
-  pcanvas.width=Math.round(needW*dpr); pcanvas.height=Math.round(needH*dpr);
-  pctx.setTransform(dpr,0,0,dpr,0,0);
-  pcanvas.style.transform = presentRot?"rotate(90deg)":"none";
-  pcanvas._cssW=needW; pcanvas._cssH=needH; pcanvas._rot=presentRot;
-  document.getElementById("rotHint").textContent = presentRot ? "↻ rotate phone to landscape for the natural view" : "";
+  const dpr=Math.min(window.devicePixelRatio||1,3);
+  if(pcanvas._W!==W || pcanvas._H!==H){
+    pcanvas.style.width=W+"px"; pcanvas.style.height=H+"px"; pcanvas.style.transform="none";
+    pcanvas.width=Math.round(W*dpr); pcanvas.height=Math.round(H*dpr);
+    pctx.setTransform(dpr,0,0,dpr,0,0);
+    pcanvas._W=W; pcanvas._H=H;
+  }
+  const portrait = H>W;
+  document.getElementById("rotHint").textContent = portrait ? "↻ rotate phone to landscape for the natural view" : "";
+
+  const content = currentContent();
+  const scale = state.settings.fontScale||1;
+  const bold = !!state.settings.bold, fill = !!state.settings.fill, invert = !!state.settings.invert;
+  const letterColor = state.settings.letterColor||"#ffffff";
+  const bright = state.settings.brightness/100;
+
+  const M = textMatrix(content.text, content.icon, scale, bold);
+  const Hm = M.height, Wm = M.width;
+
+  // pitch sized so the 72-col bar nearly spans the long axis (same letter size as the inline bar);
+  // dots then cover the WHOLE screen so there are no black margins.
+  const longPx = portrait ? H : W;
+  const pitch = 0.98*longPx/COLS;
+  const rDot = pitch*0.40;
+  const gcols = Math.ceil(W/pitch), grows = Math.ceil(H/pitch);
+  const longDots = portrait ? grows : gcols;    // text axis = full screen length
+  const shortDots = portrait ? gcols : grows;
+  const shortStart = Math.floor((shortDots-ROWS)/2);   // centre the 16-row band on the short axis
+
+  let anim = content.anim;
+  if(reduceMotion && (anim==="blink"||anim==="pulse"||anim==="rainbow")) anim="static";
+  let globalMul=1;
+  if(anim==="blink") globalMul=(Math.floor(now/450)%2===0)?1:0.06;
+  if(anim==="pulse") globalMul=0.45+0.55*(0.5+0.5*Math.sin(now/500));
+
+  const overflow = Wm>longDots;
+  let base;
+  if(anim==="scroll"||overflow){ const span=Wm+longDots; base = longDots-(scrollX%span); }
+  else base = Math.round((longDots-Wm)/2);
+  const yBaseM = Math.floor((ROWS-Hm)/2);
+
+  pctx.clearRect(0,0,W,H);
+  for(let gy=0; gy<grows; gy++){
+    for(let gx=0; gx<gcols; gx++){
+      const cx=gx*pitch+pitch/2, cy=gy*pitch+pitch/2;
+      const longI = portrait ? gy : gx;
+      const crossI = portrait ? gx : gy;
+
+      let textOn=false;
+      const mr = (crossI - shortStart) - yBaseM;
+      if(mr>=0 && mr<Hm){
+        if(anim==="scroll"||overflow){
+          const span=Wm+longDots; let mc=Math.floor(longI-base); mc=((mc%span)+span)%span;
+          if(mc<Wm && M.rows[mr][mc]) textOn=true;
+        } else {
+          const mc=longI-base; if(mc>=0 && mc<Wm && M.rows[mr][mc]) textOn=true;
+        }
+      }
+
+      let on=false, colHex=content.color, mul=globalMul, bloom=true;
+      if(fill){
+        const fieldColor = invert?letterColor:content.color;
+        const inkColor   = invert?content.color:letterColor;
+        on=true;
+        if(textOn){ colHex=inkColor; } else { colHex=fieldColor; bloom=false; mul=globalMul*0.55; }
+      } else {
+        if(textOn){ on=true; colHex = anim==="rainbow" ? hslToHex((longI*7+now/16)%360,90,58) : content.color; }
+      }
+
+      if(on){
+        const [r,g2,b]=hexToRgb(colHex);
+        const a=Math.max(0,Math.min(1,mul*bright));
+        if(bloom){ pctx.beginPath(); pctx.fillStyle=`rgba(${r},${g2},${b},${0.15*a})`; pctx.arc(cx,cy,rDot*1.75,0,7); pctx.fill(); }
+        pctx.beginPath(); pctx.fillStyle=`rgba(${r},${g2},${b},${a})`; pctx.arc(cx,cy,rDot,0,7); pctx.fill();
+      } else {
+        pctx.beginPath(); pctx.fillStyle="rgba(150,160,175,0.05)"; pctx.arc(cx,cy,rDot*0.82,0,7); pctx.fill();
+      }
+    }
+  }
 }
 
 /* ============================ audio ============================ */
@@ -841,7 +909,8 @@ sWake.addEventListener("change",()=>{ state.settings.wake=sWake.checked; save();
 document.getElementById("presentBtn").addEventListener("click",openPresent);
 document.getElementById("presentBtn2").addEventListener("click",openPresent);
 document.getElementById("exitPresent").addEventListener("click",closePresent);
-window.addEventListener("resize",()=>{ if(presentOn) sizePresent(true); kick(); });
+window.addEventListener("resize", kick);
+window.addEventListener("orientationchange", ()=>setTimeout(kick,120));
 document.addEventListener("keydown",e=>{ if(e.key==="Escape"&&presentOn) closePresent(); });
 
 // wall clock on plate
